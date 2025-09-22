@@ -30,7 +30,6 @@ PRODUCTS = [
     "850 mb wind and height",
     "Surface-based CAPE and wind barbs",
     "Precipitation (convective water)",
-    "Total precipitation",  # Added total precip option
 ]
 
 # -------------------- UI --------------------
@@ -181,14 +180,18 @@ def open_grbs(path):  # fresh handle per plot
 def is_pre_oct_2008(when):
     return when < RUC2_TO_RUC130
 
-# -------------------- Field finders (FIXED to get exact variables) --------------------
+# -------------------- Field finders (explicit per your request) --------------------
 def get_mslp(grbs, when):
     if is_pre_oct_2008(when):
-        # EXACT: 223: MSLP (MAPS System Reduction) | Type meanSea | Level: 0 | Units: Pa
+        # EXACT: 223: MSLP (MAPS System Reduction) | Type meanSea
+        g = None
         try:
-            return grbs.select(name="MSLP (MAPS System Reduction)", typeOfLevel="meanSea")[0]
+            g = grbs.select(name="MSLP (MAPS System Reduction)", typeOfLevel="meanSea")[0]
         except Exception:
-            raise KeyError("Pre-2008 MSLP (MAPS System Reduction) not found.")
+            pass
+        if g is not None:
+            return g
+        raise KeyError("Pre-2008 MSLP (MAPS System Reduction) not found.")
     else:
         # Post-2008: common variants
         for tries in (
@@ -206,7 +209,7 @@ def get_mslp(grbs, when):
 
 def get_sbcape(grbs, when):
     if is_pre_oct_2008(when):
-        # EXACT: 234: Convective available potential energy | Type: surface | Level: 0 | Units: J kg**-1
+        # EXACT: 234: Convective available potential energy | Type surface
         try:
             return grbs.select(name="Convective available potential energy", typeOfLevel="surface")[0]
         except Exception:
@@ -227,54 +230,19 @@ def get_sbcape(grbs, when):
         raise KeyError("Post-2008 SBCAPE not found.")
 
 def get_conv_precip(grbs, when):
-    # EXACT specifications you provided:
-    # PRE 10/2008: 239: Convective precipitation (water) | Type: surface | Level: 0 | Units: kg m**-2
-    # POST 10/2008 (2025): 252: Convective precipitation (water) | Type: surface | Level: 0 | Units: kg m**-2
-    # (2014): 238: Convective precipitation (water) | Type: surface | Level: 0 | Units: kg m**-2
-    
-    try:
-        return grbs.select(name="Convective precipitation (water)", typeOfLevel="surface")[0]
-    except Exception:
-        # Fallback attempts
-        for tries in (
-            {"shortName": "cp", "typeOfLevel": "surface"},
-            {"name": "Convective precipitation", "typeOfLevel": "surface"},
-        ):
-            try:
-                return grbs.select(**tries)[0]
-            except Exception:
-                continue
-        raise KeyError("Convective precipitation (water) at surface not found.")
-
-def get_total_precip(grbs, when):
-    # Try to get total precipitation (convective + stratiform)
+    # EXACT choices you specified for all eras
+    # Pre-2008 (RUC2): 239 Convective precipitation (water) | surface
+    # 2014 RAP:        238 Convective precipitation (water) | surface
+    # 2025 RAP:        252 Convective precipitation (water) | surface
     for tries in (
-        {"name": "Total precipitation", "typeOfLevel": "surface"},
-        {"shortName": "tp", "typeOfLevel": "surface"},
-        {"name": "Precipitation rate", "typeOfLevel": "surface"},
-        {"shortName": "prate", "typeOfLevel": "surface"},
-        {"name": "Large scale precipitation", "typeOfLevel": "surface"},
-        {"shortName": "lsp", "typeOfLevel": "surface"},
+        {"name": "Convective precipitation (water)", "typeOfLevel": "surface"},
+        {"shortName": "cp", "typeOfLevel": "surface"},
     ):
         try:
             return grbs.select(**tries)[0]
         except Exception:
             continue
-    raise KeyError("Total precipitation not found.")
-
-# -------------------- Debugging function --------------------
-def list_precip_variables(grbs):
-    """List all precipitation-related variables in the GRIB file for debugging"""
-    precip_vars = []
-    for msg in grbs:
-        name = getattr(msg, 'name', '')
-        shortName = getattr(msg, 'shortName', '')
-        typeOfLevel = getattr(msg, 'typeOfLevel', '')
-        level = getattr(msg, 'level', 0)
-        if any(term in name.lower() for term in ['precip', 'rain', 'convective']) or \
-           any(term in shortName.lower() for term in ['tp', 'cp', 'prate', 'lsp']):
-            precip_vars.append(f"{name} | {shortName} | {typeOfLevel} | {level}")
-    return precip_vars
+    raise KeyError("Convective precipitation (water) at surface not found.")
 
 # -------------------- Base map + finishing --------------------
 def base_ax():
@@ -394,91 +362,26 @@ def plot_sbcape_barbs(grbs, when):
     return finish_and_return(fig, title)
 
 def plot_conv_precip(grbs, when):
-    try:
-        cp = get_conv_precip(grbs, when)
-        data = np.array(cp.values, dtype=float)  # kg m^-2 == mm accumulation
-        lats, lons = cp.latlons()
+    cp = get_conv_precip(grbs, when)  # EXACT variable you specified
+    data = np.array(cp.values, dtype=float)  # kg m^-2 == mm accumulation
+    lats, lons = cp.latlons()
 
-        # Mask out very small values to avoid plotting noise
-        data = np.where(data < 0.01, np.nan, data)
-        
-        # Get statistics for better scaling
-        valid_data = data[~np.isnan(data)]
-        if len(valid_data) == 0:
-            st.warning("No valid precipitation data found in this file.")
-            vmax = 25.0  # Default scale
-        else:
-            data_max = np.nanmax(valid_data)
-            data_99th = np.nanpercentile(valid_data, 99)
-            vmax = max(10.0, min(data_99th * 1.2, data_max))
+    # If the analysis time has little/zero accum, still render a visible scale.
+    vmax = max(10.0, float(np.nanpercentile(data, 99)))
+    levels = np.linspace(0, vmax, 51)
 
-        levels = np.linspace(0, vmax, 51)
-        cm = plt.get_cmap("turbo")
+    # Use turbo here for visibility; your ERA5 CP used white→jet but this is fine for RAP/RUC.
+    cm = plt.get_cmap("turbo")
 
-        fig = plt.figure(figsize=(13.0, 8.6))
-        ax = base_ax()
-        
-        # Only plot where data > 0.01 mm
-        cf = ax.contourf(lons, lats, data, levels=levels, cmap=cm,
-                         transform=ccrs.PlateCarree(), extend="max")
-        cbar = fig.colorbar(cf, ax=ax, pad=0.01, aspect=28)
-        cbar.set_label("Convective precipitation (mm)")
+    fig = plt.figure(figsize=(13.0, 8.6))
+    ax = base_ax()
+    cf = ax.contourf(lons, lats, data, levels=levels, cmap=cm,
+                     transform=ccrs.PlateCarree(), extend="max")
+    cbar = fig.colorbar(cf, ax=ax, pad=0.01, aspect=28)
+    cbar.set_label("Convective precipitation (mm, accumulation)")
 
-        title = f"Convective Precipitation — {when:%B %d, %Y %H:00 UTC}"
-        return finish_and_return(fig, title)
-    
-    except KeyError as e:
-        st.error(f"Could not find convective precipitation variable: {e}")
-        # Show available precipitation variables for debugging
-        precip_vars = list_precip_variables(grbs)
-        if precip_vars:
-            st.info("Available precipitation-related variables:")
-            for var in precip_vars:
-                st.text(var)
-        raise
-
-def plot_total_precip(grbs, when):
-    try:
-        tp = get_total_precip(grbs, when)
-        data = np.array(tp.values, dtype=float)  # kg m^-2 == mm accumulation
-        lats, lons = tp.latlons()
-
-        # Mask out very small values
-        data = np.where(data < 0.01, np.nan, data)
-        
-        # Get statistics for better scaling
-        valid_data = data[~np.isnan(data)]
-        if len(valid_data) == 0:
-            st.warning("No valid total precipitation data found in this file.")
-            vmax = 25.0
-        else:
-            data_max = np.nanmax(valid_data)
-            data_99th = np.nanpercentile(valid_data, 99)
-            vmax = max(10.0, min(data_99th * 1.2, data_max))
-
-        levels = np.linspace(0, vmax, 51)
-        cm = plt.get_cmap("Blues")  # Use Blues for total precip
-
-        fig = plt.figure(figsize=(13.0, 8.6))
-        ax = base_ax()
-        
-        cf = ax.contourf(lons, lats, data, levels=levels, cmap=cm,
-                         transform=ccrs.PlateCarree(), extend="max")
-        cbar = fig.colorbar(cf, ax=ax, pad=0.01, aspect=28)
-        cbar.set_label("Total precipitation (mm)")
-
-        title = f"Total Precipitation — {when:%B %d, %Y %H:00 UTC}"
-        return finish_and_return(fig, title)
-    
-    except KeyError as e:
-        st.error(f"Could not find total precipitation variable: {e}")
-        # Show available precipitation variables for debugging
-        precip_vars = list_precip_variables(grbs)
-        if precip_vars:
-            st.info("Available precipitation-related variables:")
-            for var in precip_vars:
-                st.text(var)
-        raise
+    title = f"Precipitation — {when:%B %d, %Y %H:00 UTC}"
+    return finish_and_return(fig, title)
 
 # -------------------- Run --------------------
 if generate_btn:
@@ -499,8 +402,6 @@ if generate_btn:
                 buf = plot_sbcape_barbs(grbs, when)
             elif product == "Precipitation (convective water)":
                 buf = plot_conv_precip(grbs, when)
-            elif product == "Total precipitation":
-                buf = plot_total_precip(grbs, when)
             else:
                 st.error("Unknown product.")
                 st.stop()
@@ -510,12 +411,11 @@ if generate_btn:
         st.download_button(
             "Download PNG",
             data=buf,
-            file_name=f"RAP_RUC_{product.replace(' ','_').replace('(','').replace(')','').replace(',','_')}_{when:%Y%m%d%H}.png",
+            file_name=f"RAP_RUC_{product.replace(' ','_')}_{when:%Y%m%d%H}.png",
             mime="image/png"
         )
     except Exception as e:
         st.error(f"Error: {e}")
-        st.info("Try a different date/time, or check if the GRIB file exists for this period.")
     finally:
         # keep cached file on disk; handles are closed above
         pass
