@@ -1,0 +1,8 @@
+streamlit==1.37.1
+numpy>=1.24
+matplotlib>=3.7
+cartopy>=0.22
+pygrib>=2.1.5
+pyproj>=3.6
+shapely>=2.0
+requests>=2.31
