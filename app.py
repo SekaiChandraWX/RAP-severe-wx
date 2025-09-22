@@ -225,7 +225,6 @@ def base_ax(fig):
 
 def finish_and_return(fig, ax, title):
     ax.set_title(title, fontsize=15, fontweight="bold", pad=10)
-    # anchor attribution relative to axes to keep margins tight
     ax.text(0.5, -0.06, "Plotted by Sekai Chandra (@Sekai_WX)",
             ha="center", va="top", fontsize=9, fontweight="bold", transform=ax.transAxes)
     fig.subplots_adjust(left=0.03, right=0.985, top=0.93, bottom=0.08)
@@ -241,7 +240,7 @@ def plot_dew_mslp_barbs(grbs, when):
     d2m = pick_var(grbs, [
         {"name":"2 metre dewpoint temperature"},
         {"name":"2 m above ground Dew point temperature"},
-        {"shortName":"2d"},  # GRIB shortName (often GRIB1)
+        {"shortName":"2d"},
     ])
 
     # 10 m winds across eras
@@ -263,8 +262,8 @@ def plot_dew_mslp_barbs(grbs, when):
         {"name":"Mean sea level pressure"},
         {"name":"MSL Pressure reduced to MSL"},
         {"shortName":"mslet"},
-        {"shortName":"prmsl"},   # GRIB1 reduced MSLP
-        {"shortName":"msl"},     # generic MSL pressure
+        {"shortName":"prmsl"},
+        {"shortName":"msl"},
     ])
 
     dewK = d2m.values
@@ -332,14 +331,18 @@ def plot_wind_height(grbs, level_mb, is_500, when):
     return finish_and_return(fig, ax, title)
 
 def plot_sbcape_barbs(grbs, when):
-    cape_grb = (select_one(grbs, name="Convective available potential energy", typeOfLevel="surface")
-                or select_one(grbs, shortName="cape", typeOfLevel="surface")
-                or select_one(grbs, name="Convective available potential energy",
-                              typeOfLevel="pressureFromGroundLayer", level=25500)
-                or select_one(grbs, name="Convective available potential energy",
-                              typeOfLevel="pressureFromGroundLayer", level=9000)
-                or select_one(grbs, name="Convective available potential energy",
-                              typeOfLevel="pressureFromGroundLayer", level=18000))
+    cape_grb = (
+        # common modern encodings
+        select_one(grbs, name="Convective available potential energy", typeOfLevel="surface")
+        or select_one(grbs, shortName="cape", typeOfLevel="surface")
+        # RUC encodings (layered)
+        or select_one(grbs, name="Convective available potential energy", typeOfLevel="pressureFromGroundLayer", level=25500)
+        or select_one(grbs, name="Convective available potential energy", typeOfLevel="pressureFromGroundLayer", level=9000)
+        or select_one(grbs, name="Convective available potential energy", typeOfLevel="pressureFromGroundLayer", level=18000)
+        # GRIB1/RUC2 oddity: heightAboveGroundLayer, level 0
+        or select_one(grbs, name="Convective available potential energy", typeOfLevel="heightAboveGroundLayer", level=0)
+        or select_one(grbs, shortName="cape", typeOfLevel="heightAboveGroundLayer", level=0)
+    )
     if cape_grb is None:
         raise KeyError("Could not locate SBCAPE in this file.")
 
@@ -372,13 +375,45 @@ def plot_sbcape_barbs(grbs, when):
     return finish_and_return(fig, ax, title)
 
 def plot_conv_precip(grbs, when):
-    cp = pick_var(grbs, [
-        {"name":"Convective precipitation (water)", "typeOfLevel":"surface"},
-        {"shortName":"acpcp"},  # accumulated convective precipitation (common alias)
-        {"shortName":"cp"},
-    ])
-    cp_mm = cp.values  # kg m^-2 == mm
-    lats, lons = cp.latlons()
+    # 1) direct convective accumulation
+    cp = (select_one(grbs, name="Convective precipitation (water)", typeOfLevel="surface")
+          or select_one(grbs, shortName="acpcp")
+          or select_one(grbs, shortName="cp"))
+    lats = lons = None
+    cp_mm = None
+    if cp is not None:
+        cp_mm = cp.values  # kg m^-2 == mm
+        lats, lons = cp.latlons()
+        # many "analysis" files carry zeros everywhere — detect and fall back
+        if np.nanmax(cp_mm) < 1e-6:
+            cp_mm = None
+
+    # 2) convective precip rate (kg m^-2 s^-1) -> mm/h
+    if cp_mm is None:
+        cprate = (select_one(grbs, name="Convective precipitation rate", typeOfLevel="surface")
+                  or select_one(grbs, shortName="cprat"))
+        if cprate is not None:
+            cpr = cprate.values * 3600.0
+            lats, lons = cprate.latlons()
+            if np.isfinite(cpr).any():
+                cp_mm = cpr
+
+    # 3) total rate minus large-scale rate (if available)
+    if cp_mm is None:
+        tot_rate = (select_one(grbs, name="Precipitation rate", typeOfLevel="surface")
+                    or select_one(grbs, shortName="prate"))
+        ls_rate = (select_one(grbs, name="Large scale precipitation rate", typeOfLevel="surface")
+                   or select_one(grbs, shortName="lsprate"))
+        if tot_rate is not None:
+            tr = tot_rate.values * 3600.0
+            lats, lons = tot_rate.latlons()
+            if ls_rate is not None:
+                cp_mm = np.clip(tr - ls_rate.values * 3600.0, 0, None)
+            else:
+                cp_mm = tr
+
+    if cp_mm is None or lats is None:
+        raise KeyError("Convective precipitation not available for this hour (analysis files often store 0). Try a nearby hour.")
 
     cm, norm = cp_cmap_and_norm()
 
