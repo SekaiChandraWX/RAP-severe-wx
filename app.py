@@ -1,3 +1,4 @@
+# app.py
 import streamlit as st
 import numpy as np
 import matplotlib.pyplot as plt
@@ -9,7 +10,9 @@ import pygrib
 import datetime as dt
 import tempfile
 import urllib.request
+import contextlib
 import os
+from urllib.error import HTTPError, URLError
 from io import BytesIO
 
 # -------------------- Streamlit page --------------------
@@ -19,11 +22,9 @@ st.title("RAP / RUC Weather Visualization")
 # -------------------- Constants --------------------
 CONUS_EXTENT = [-125, -66.5, 20, 55]
 
-# Known breakpoints:
-RUC_TO_RAP = dt.datetime(2012, 5, 1, 12)        # RAP replaces RUC (NCEI / Weather.gov) :contentReference[oaicite:0]{index=0}
-GRIB1_SUPPORT_END = dt.datetime(2008, 5, 1, 0)  # NCEP GRIB1->GRIB2 support ended May 1, 2008 (TIN 07-49). :contentReference[oaicite:1]{index=1}
-# Community knowledge + common archive practice: RUC2 (grid 252, GRIB1) used into late 2008, then RUC "130" GRIB2; app handles both.
-RUC2_TO_RUC130 = dt.datetime(2008, 10, 29, 23)  # (practical archive boundary widely used in RUC/RAP pulls)
+# Era boundaries (practical for NCEI archive):
+RUC2_TO_RUC130 = dt.datetime(2008, 10, 29, 23, tzinfo=dt.UTC)  # ruc2anl_252 (GRIB1) -> ruc2anl_130 (GRIB2)
+RUC_TO_RAP     = dt.datetime(2012, 5, 1, 12, tzinfo=dt.UTC)    # RAP replaces RUC
 
 PRODUCTS = [
     "Dewpoint, MSLP, and wind barbs",
@@ -35,14 +36,15 @@ PRODUCTS = [
 
 # -------------------- UI --------------------
 col1, col2, col3, col4 = st.columns(4)
+utc_year_default = dt.datetime.now(dt.UTC).year
 with col1:
-    year = st.number_input("Year (UTC)", 1999, dt.datetime.utcnow().year, 2014)
+    year = st.number_input("Year (UTC)", 1999, utc_year_default, 2014)
 with col2:
-    month = st.number_input("Month", 1, 12, 5)
+    month = st.number_input("Month", 1, 12, 4)
 with col3:
-    day = st.number_input("Day", 1, 31, 1)
+    day = st.number_input("Day", 1, 31, 28)
 with col4:
-    hour = st.number_input("Hour (UTC)", 0, 23, 18)
+    hour = st.number_input("Hour (UTC)", 0, 23, 0)
 
 col5, col6 = st.columns([2, 2])
 with col5:
@@ -124,7 +126,7 @@ def wind850_cmap():
     return ListedColormap(cols), BoundaryNorm(levels, len(cols)), levels
 
 def cp_cmap_and_norm():
-    # match your "white to 0.1 mm then jet up to 10 mm"
+    # white -> 0.1 mm then jet -> 10 mm
     jet = plt.get_cmap("jet")
     whites = [(1,1,1)] * 10
     n_colors = 99
@@ -136,38 +138,77 @@ def cp_cmap_and_norm():
 # -------------------- Data access helpers --------------------
 @st.cache_data(show_spinner=False)
 def download_grib(year, month, day, hour):
-    when = dt.datetime(int(year), int(month), int(day), int(hour))
+    """
+    Tries multiple URL patterns + filenames and verifies non-trivial file size.
+
+    Matches your samples:
+      - RAP new path (minutes in name):
+        https://www.ncei.noaa.gov/data/rapid-refresh/access/rap-130-13km/analysis/202505/20250516/rap_130_20250516_0000_000.grb2
+      - RAP historical path (minutes in name):
+        https://www.ncei.noaa.gov/data/rapid-refresh/access/historical/analysis/201404/20140428/rap_130_20140428_0000_000.grb2
+      - RUC2 GRIB1 historical (minutes in name):
+        https://www.ncei.noaa.gov/data/rapid-refresh/access/historical/analysis/200702/20070202/ruc2anl_252_20070202_0000_000.grb
+    """
+    when = dt.datetime(int(year), int(month), int(day), int(hour), tzinfo=dt.UTC)
     yyyymm = when.strftime("%Y%m")
     yyyymmdd = when.strftime("%Y%m%d")
-    stamp = when.strftime("%Y%m%d_%H%M")
-    # Filenames per common NCEI archive conventions
+
+    def looks_like_grib(path: str) -> bool:
+        try:
+            sz = os.path.getsize(path)
+        except OSError:
+            return False
+        return sz > 100_000  # avoid saving HTML index/error pages
+
+    # Filename templates: try minutes and seconds flavors
     if when < RUC2_TO_RUC130:
         # RUC2 (grid 252), GRIB1
-        fname = f"ruc2anl_252_{stamp}_000.grb"
-        url = f"https://www.ncei.noaa.gov/data/rapid-refresh/access/historical/analysis/{yyyymm}/{yyyymmdd}/{fname}"
+        fn_templates = [
+            f"ruc2anl_252_{when.strftime('%Y%m%d_%H%M')}_000.grb",
+            f"ruc2anl_252_{when.strftime('%Y%m%d_%H%S')}_000.grb",
+        ]
+        roots = [
+            f"https://www.ncei.noaa.gov/data/rapid-refresh/access/historical/analysis/{yyyymm}/{yyyymmdd}/",
+        ]
     elif when < RUC_TO_RAP:
         # RUC (grid 130), GRIB2
-        fname = f"ruc2anl_130_{stamp}_000.grb2"
-        url = f"https://www.ncei.noaa.gov/data/rapid-refresh/access/historical/analysis/{yyyymm}/{yyyymmdd}/{fname}"
+        fn_templates = [
+            f"ruc2anl_130_{when.strftime('%Y%m%d_%H%M')}_000.grb2",
+            f"ruc2anl_130_{when.strftime('%Y%m%d_%H%S')}_000.grb2",
+        ]
+        roots = [
+            f"https://www.ncei.noaa.gov/data/rapid-refresh/access/historical/analysis/{yyyymm}/{yyyymmdd}/",
+        ]
     else:
-        # RAP (grid 130), GRIB2 (NCEI has both historical/ and rap-130-13km/ trees; try new RAP first)
-        fname = f"rap_130_{stamp}_000.grb2"
-        # Prefer the rap-130-13km path for recent data; fall back to historical if needed
-        new_url = f"https://www.ncei.noaa.gov/data/rapid-refresh/access/rap-130-13km/analysis/{yyyymm}/{yyyymmdd}/{fname}"
-        legacy_url = f"https://www.ncei.noaa.gov/data/rapid-refresh/access/historical/analysis/{yyyymm}/{yyyymmdd}/{fname}"
-        url = new_url
+        # RAP (grid 130), GRIB2
+        fn_templates = [
+            f"rap_130_{when.strftime('%Y%m%d_%H%M')}_000.grb2",
+            f"rap_130_{when.strftime('%Y%m%d_%H%S')}_000.grb2",
+        ]
+        roots = [
+            f"https://www.ncei.noaa.gov/data/rapid-refresh/access/rap-130-13km/analysis/{yyyymm}/{yyyymmdd}/",
+            f"https://www.ncei.noaa.gov/data/rapid-refresh/access/historical/analysis/{yyyymm}/{yyyymmdd}/",
+        ]
+
     tmpdir = tempfile.mkdtemp()
-    local = os.path.join(tmpdir, fname)
-    try:
-        urllib.request.urlretrieve(url, local)
-    except Exception:
-        # fallback for RAP if new tree fails
-        if "rap-130-13km" in url:
-            fallback = legacy_url
-            urllib.request.urlretrieve(fallback, local)
-        else:
-            raise
-    return local
+    last_err = None
+
+    for fname in fn_templates:
+        for root in roots:
+            url = root + fname
+            local = os.path.join(tmpdir, fname)
+            try:
+                # Some servers don't support HEAD; just download and check size.
+                urllib.request.urlretrieve(url, local)
+                if looks_like_grib(local):
+                    return local
+                else:
+                    last_err = RuntimeError(f"Downloaded but too small: {url}")
+            except (HTTPError, URLError, TimeoutError, RuntimeError) as e:
+                last_err = e
+                continue
+
+    raise RuntimeError(f"Could not locate GRIB for {when:%Y-%m-%d %H:00} UTC. Last error: {last_err}")
 
 def open_grbs(path):
     return pygrib.open(path)
@@ -179,16 +220,15 @@ def select_one(grbs, **kwargs):
     except Exception:
         return None
 
-def pick_var(grbs, names_levels):
+def pick_var(grbs, attempts):
     """
-    names_levels: list of dicts for attempts.
-    Example: [{"name": "MSLP (MAPS System Reduction)"}, {"shortName":"mslet"}]
+    attempts: list[dict] for pygrib.select(**kwargs) attempts
     """
-    for attempt in names_levels:
-        g = select_one(grbs, **attempt)
+    for a in attempts:
+        g = select_one(grbs, **a)
         if g is not None:
             return g
-    raise KeyError(f"Could not find variable with attempts: {names_levels}")
+    raise KeyError(f"Could not find variable with attempts: {attempts}")
 
 # -------------------- Plot helpers --------------------
 def base_ax():
@@ -213,12 +253,22 @@ def finish_and_return(fig, title):
 
 # -------------------- Product renderers --------------------
 def plot_dew_mslp_barbs(grbs, when):
-    # Names consistent with your script + era fallbacks (see variable lists you provided)
-    # Dewpoint @2m appears across eras (2007/2014/2025 lists). :contentReference[oaicite:2]{index=2} :contentReference[oaicite:3]{index=3} :contentReference[oaicite:4]{index=4}
-    d2m = pick_var(grbs, [{"name":"2 metre dewpoint temperature"}, {"name":"2 m above ground Dew point temperature"}])
-    u10 = pick_var(grbs, [{"name":"10 metre U wind component", "level":10}, {"name":"U component of wind", "typeOfLevel":"heightAboveGround", "level":10}])
-    v10 = pick_var(grbs, [{"name":"10 metre V wind component", "level":10}, {"name":"V component of wind", "typeOfLevel":"heightAboveGround", "level":10}])
-    mslp = pick_var(grbs, [{"name":"MSLP (MAPS System Reduction)"}])  # present across eras. :contentReference[oaicite:5]{index=5}
+    d2m = pick_var(grbs, [
+        {"name":"2 metre dewpoint temperature"},
+        {"name":"2 m above ground Dew point temperature"},
+    ])
+    u10 = pick_var(grbs, [
+        {"name":"10 metre U wind component", "level":10},
+        {"name":"U component of wind", "typeOfLevel":"heightAboveGround", "level":10},
+    ])
+    v10 = pick_var(grbs, [
+        {"name":"10 metre V wind component", "level":10},
+        {"name":"V component of wind", "typeOfLevel":"heightAboveGround", "level":10},
+    ])
+    mslp = pick_var(grbs, [
+        {"name":"MSLP (MAPS System Reduction)"},
+        {"shortName":"mslet"},  # occasional alternate
+    ])
 
     dewK = d2m.values
     dewF = (dewK - 273.15)*9/5 + 32.0
@@ -232,80 +282,78 @@ def plot_dew_mslp_barbs(grbs, when):
     fig = plt.figure(figsize=(13.5, 9))
     ax = base_ax()
 
-    cf = ax.contourf(lons, lats, dewF, levels=np.linspace(-40, 90, cmap.N+1), cmap=cmap, norm=norm, transform=ccrs.PlateCarree(), extend="both")
-    cbar = plt.colorbar(cf, ax=ax, pad=0.02, aspect=30)
+    cf = ax.contourf(
+        lons, lats, dewF,
+        levels=np.linspace(-40, 90, cmap.N+1),
+        cmap=cmap, norm=norm,
+        transform=ccrs.PlateCarree(), extend="both"
+    )
+    cbar = fig.colorbar(cf, ax=ax, pad=0.02, aspect=30)
     cbar.set_label("Dewpoint (°F)")
 
-    # MSLP every 2 mb, like your RAPDEW script
-    levels = np.arange(900, 1100, 2)
+    levels = np.arange(900, 1100, 2)  # 2 mb spacing
     cs = ax.contour(lons, lats, p, levels=levels, colors="black", linewidths=0.8, transform=ccrs.PlateCarree())
     ax.clabel(cs, inline=True, fontsize=8)
 
     ax.barbs(lons[::10, ::10], lats[::10, ::10], u[::10, ::10], v[::10, ::10], length=6, transform=ccrs.PlateCarree())
 
-    title = f"Dewpoint (°F), MSLP (mb), and 10m wind — {when:%B %d, %Y %H:00 UTC}"
+    title = f"Dewpoint (°F), MSLP (mb), and 10 m wind — {when:%B %d, %Y %H:00 UTC}"
     return finish_and_return(fig, title)
 
-def plot_wind_height(grbs, level_mb, is_500=True, when=None):
-    # u/v and geopotential height @ isobaric level
+def plot_wind_height(grbs, level_mb, is_500, when):
     u = pick_var(grbs, [{"name":"U component of wind", "level":level_mb}])
     v = pick_var(grbs, [{"name":"V component of wind", "level":level_mb}])
     z = pick_var(grbs, [{"name":"Geopotential height", "level":level_mb}])
 
     uu = u.values; vv = v.values
-    zvals = z.values  # already in gpm in GRIB
+    zvals = z.values  # gpm
     lats, lons = z.latlons()
 
     wspd_kt = np.sqrt(uu**2 + vv**2) * 1.94384
     if is_500:
         cmap, bnorm, levels = wind500_cmap()
-        contour_levels = np.arange(480, 600, 6)  # decameters for 500mb
-        label = "Wind Speed (kt)"
+        h_levels = np.arange(480, 600, 6)  # dam
+        name = "500 mb wind & height"
     else:
         cmap, bnorm, levels = wind850_cmap()
-        contour_levels = np.arange(120, 180, 3)  # decameters for 850mb
-        label = "Wind Speed (kt)"
+        h_levels = np.arange(120, 180, 3)  # dam
+        name = "850 mb wind & height"
 
     fig = plt.figure(figsize=(13.5, 9))
     ax = base_ax()
 
     cf = ax.contourf(lons, lats, wspd_kt, levels=levels, cmap=cmap, norm=bnorm, transform=ccrs.PlateCarree())
-    cbar = plt.colorbar(cf, ax=ax, pad=0.02, aspect=30)
-    cbar.set_label(label)
+    cbar = fig.colorbar(cf, ax=ax, pad=0.02, aspect=30)
+    cbar.set_label("Wind Speed (kt)")
 
-    cs = ax.contour(lons, lats, zvals/10.0, levels=contour_levels, colors="black", linewidths=1.0, transform=ccrs.PlateCarree())
+    cs = ax.contour(lons, lats, zvals/10.0, levels=h_levels, colors="black", linewidths=1.0, transform=ccrs.PlateCarree())
     ax.clabel(cs, inline=True, fontsize=8, fmt="%d")
+
     ax.barbs(lons[::10, ::10], lats[::10, ::10], uu[::10, ::10], vv[::10, ::10], length=6, transform=ccrs.PlateCarree())
 
-    lvl = f"{level_mb} mb"
-    name = "500 mb wind & height" if is_500 else "850 mb wind & height"
-    title = f"{name} — {when:%B %d, %Y %H:00 UTC} ({lvl})"
+    title = f"{name} — {when:%B %d, %Y %H:00 UTC}"
     return finish_and_return(fig, title)
 
 def plot_sbcape_barbs(grbs, when):
-    """
-    SBCAPE source across eras:
-      - Surface CAPE exists in 2007 & 2025 variable lists ("Convective available potential energy" | Type: surface) :contentReference[oaicite:6]{index=6} :contentReference[oaicite:7]{index=7}
-      - Layer-based CAPE is also present (pressureFromGroundLayer 9000/18000/25500); choose surface if available, else choose the 25500 layer as a proxy. :contentReference[oaicite:8]{index=8} :contentReference[oaicite:9]{index=9}
-    """
-    # Prefer true surface CAPE
+    # Prefer surface CAPE; fall back to common pressureFromGroundLayer proxies
     cape_grb = select_one(grbs, name="Convective available potential energy", typeOfLevel="surface")
     if cape_grb is None:
-        # Common fallback: 25500 Pa layer from ground (often used as SBCAPE proxy in archives)
-        cape_grb = select_one(grbs, name="Convective available potential energy", typeOfLevel="pressureFromGroundLayer", level=25500)
-    if cape_grb is None:
-        # Additional fallbacks (9000 or 18000 Pa layers)
-        cape_grb = select_one(grbs, name="Convective available potential energy", typeOfLevel="pressureFromGroundLayer", level=9000) \
+        cape_grb = select_one(grbs, name="Convective available potential energy", typeOfLevel="pressureFromGroundLayer", level=25500) \
+                   or select_one(grbs, name="Convective available potential energy", typeOfLevel="pressureFromGroundLayer", level=9000) \
                    or select_one(grbs, name="Convective available potential energy", typeOfLevel="pressureFromGroundLayer", level=18000)
     if cape_grb is None:
         raise KeyError("Could not locate SBCAPE in this file.")
 
-    u10 = pick_var(grbs, [{"name":"10 metre U wind component", "level":10}, {"name":"U component of wind", "typeOfLevel":"heightAboveGround", "level":10}])
-    v10 = pick_var(grbs, [{"name":"10 metre V wind component", "level":10}, {"name":"V component of wind", "typeOfLevel":"heightAboveGround", "level":10}])
+    u10 = pick_var(grbs, [
+        {"name":"10 metre U wind component", "level":10},
+        {"name":"U component of wind", "typeOfLevel":"heightAboveGround", "level":10},
+    ])
+    v10 = pick_var(grbs, [
+        {"name":"10 metre V wind component", "level":10},
+        {"name":"V component of wind", "typeOfLevel":"heightAboveGround", "level":10},
+    ])
 
-    cape = cape_grb.values  # J/kg
-    # Strict bounds [0, 7000]; clamp and use turbo
-    cape = np.clip(cape, 0, 7000)
+    cape = np.clip(cape_grb.values, 0, 7000)
     lats, lons = cape_grb.latlons()
     u = u10.values; v = v10.values
 
@@ -314,16 +362,15 @@ def plot_sbcape_barbs(grbs, when):
 
     turbo = plt.get_cmap("turbo")
     cf = ax.contourf(lons, lats, cape, levels=np.linspace(0,7000,71), cmap=turbo, extend="max", transform=ccrs.PlateCarree())
-    cbar = plt.colorbar(cf, ax=ax, pad=0.02, aspect=30)
+    cbar = fig.colorbar(cf, ax=ax, pad=0.02, aspect=30)
     cbar.set_label("SBCAPE (J/kg) — capped at 7000")
 
     ax.barbs(lons[::10, ::10], lats[::10, ::10], u[::10, ::10], v[::10, ::10], length=6, transform=ccrs.PlateCarree())
 
-    title = f"Surface-based CAPE (J/kg) & 10m wind — {when:%B %d, %Y %H:00 UTC}"
+    title = f"Surface-based CAPE (J/kg) & 10 m wind — {when:%B %d, %Y %H:00 UTC}"
     return finish_and_return(fig, title)
 
 def plot_conv_precip(grbs, when):
-    # Convective precipitation (water) @ surface across eras (2007/2014/2025). Units kg m^-2 == mm. :contentReference[oaicite:10]{index=10} :contentReference[oaicite:11]{index=11} :contentReference[oaicite:12]{index=12}
     cp = pick_var(grbs, [{"name":"Convective precipitation (water)", "typeOfLevel":"surface"}])
     cp_mm = cp.values  # kg m^-2 == mm
     lats, lons = cp.latlons()
@@ -332,8 +379,13 @@ def plot_conv_precip(grbs, when):
 
     fig = plt.figure(figsize=(13.5, 9))
     ax = base_ax()
-    cf = ax.contourf(lons, lats, cp_mm, levels=np.linspace(0,10,51), cmap=cm, norm=norm, transform=ccrs.PlateCarree(), extend="max")
-    cbar = plt.colorbar(cf, ax=ax, pad=0.02, aspect=30)
+    cf = ax.contourf(
+        lons, lats, cp_mm,
+        levels=np.linspace(0,10,51),
+        cmap=cm, norm=norm,
+        transform=ccrs.PlateCarree(), extend="max"
+    )
+    cbar = fig.colorbar(cf, ax=ax, pad=0.02, aspect=30)
     cbar.set_label("Convective Precipitation (mm)")
 
     title = f"Convective Precipitation — {when:%B %d, %Y %H:00 UTC}"
@@ -341,8 +393,9 @@ def plot_conv_precip(grbs, when):
 
 # -------------------- Run --------------------
 if generate_btn:
+    local_path = None
     try:
-        when = dt.datetime(int(year), int(month), int(day), int(hour))
+        when = dt.datetime(int(year), int(month), int(day), int(hour), tzinfo=dt.UTC)
         st.info(f"Fetching RAP/RUC analysis for {when:%Y-%m-%d %H:00} UTC …")
         local_path = download_grib(year, month, day, hour)
 
@@ -372,7 +425,7 @@ if generate_btn:
 
     except Exception as e:
         st.error(f"Error: {e}")
-        st.info("Double-check the date/time exists in the archive and try nearby hours.")
+        st.info("If an hour 404s in one path, the app already falls back to alternates. Try ±1–2 hours if truly missing.")
     finally:
         try:
             if local_path and os.path.exists(local_path):
